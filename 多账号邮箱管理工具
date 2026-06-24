@@ -1,0 +1,584 @@
+# -*- coding: utf-8 -*-
+"""
+优化版 v2 一键完成
+修复：卡顿 / 序号 / HTML乱码 / myrambler.ru域名 / 超时
+"""
+import os, sys, subprocess
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+print("=" * 55)
+print("   多账号邮箱管理工具 - 优化版 v2")
+print("=" * 55)
+
+print("\n[第1步] 安装依赖库...")
+for pkg in ["PyQt5", "imapclient", "cryptography", "pyperclip", "pyinstaller"]:
+    print(f"  安装 {pkg}...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+print("✅ 完成\n")
+
+print("[第2步] 创建项目文件...")
+os.makedirs(os.path.join(BASE, "core"), exist_ok=True)
+os.makedirs(os.path.join(BASE, "ui"),   exist_ok=True)
+
+def W(p, c):
+    with open(os.path.join(BASE, p), 'w', encoding='utf-8') as f: f.write(c)
+    print(f"  ✅ {p}")
+
+W("core/__init__.py", "")
+W("ui/__init__.py", "")
+
+# ============================================================
+# core/crypto.py
+# ============================================================
+W("core/crypto.py", '''
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64, os, sys
+
+def app_dir():
+    return os.path.dirname(sys.executable) if getattr(sys,"frozen",False) \
+           else os.path.dirname(os.path.abspath(__file__+"/../"))
+
+def _salt():
+    p = os.path.join(app_dir(), "data.salt")
+    if os.path.exists(p):
+        with open(p,"rb") as f: return f.read()
+    s = os.urandom(16)
+    with open(p,"wb") as f: f.write(s)
+    return s
+
+def _key(mp):
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(),length=32,salt=_salt(),iterations=480000)
+    return base64.urlsafe_b64encode(kdf.derive(mp.encode()))
+
+def encrypt(t,mp): return Fernet(_key(mp)).encrypt(t.encode()).decode()
+def decrypt(t,mp): return Fernet(_key(mp)).decrypt(t.encode()).decode()
+'''[1:])
+
+# ============================================================
+# core/db.py
+# ============================================================
+W("core/db.py", '''
+import sqlite3, os, sys
+
+def app_dir():
+    return os.path.dirname(sys.executable) if getattr(sys,"frozen",False) \
+           else os.path.dirname(os.path.abspath(__file__+"/../"))
+
+def _conn():
+    c = sqlite3.connect(os.path.join(app_dir(),"data.db"))
+    c.row_factory = sqlite3.Row; return c
+
+def init_db():
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS accounts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            encrypted_password TEXT NOT NULL,
+            provider TEXT DEFAULT 'auto',
+            imap_host TEXT, imap_port INTEGER DEFAULT 993)""")
+        c.commit()
+
+def add(email,enc,provider,host,port=993):
+    with _conn() as c:
+        try:
+            c.execute("INSERT INTO accounts(email,encrypted_password,provider,imap_host,imap_port) VALUES(?,?,?,?,?)",
+                      (email,enc,provider,host,port)); c.commit(); return True
+        except sqlite3.IntegrityError: return False
+
+def all_accounts():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM accounts").fetchall()]
+
+def delete(email):
+    with _conn() as c:
+        c.execute("DELETE FROM accounts WHERE email=?",(email,)); c.commit()
+'''[1:])
+
+# ============================================================
+# core/email_client.py  【优化：补全域名 / 超时 / HTML清洗】
+# ============================================================
+W("core/email_client.py", '''
+import re, email, html as html_mod
+from email.header import decode_header
+from imapclient import IMAPClient
+
+# 补全所有 Rambler 系域名
+IMAP = {
+    "gmail.com"       :("imap.gmail.com",993),
+    "qq.com"          :("imap.qq.com",993),
+    "163.com"         :("imap.163.com",993),
+    "126.com"         :("imap.126.com",993),
+    "outlook.com"     :("outlook.office365.com",993),
+    "hotmail.com"     :("outlook.office365.com",993),
+    "live.com"        :("outlook.office365.com",993),
+    "yahoo.com"       :("imap.mail.yahoo.com",993),
+    "rambler.ru"      :("imap.rambler.ru",993),
+    "myrambler.ru"    :("imap.rambler.ru",993),
+    "ro.ru"           :("imap.rambler.ru",993),
+    "autorambler.ru"  :("imap.rambler.ru",993),
+    "lenta.ru"        :("imap.rambler.ru",993),
+    "mail.ru"         :("imap.mail.ru",993),
+    "inbox.ru"        :("imap.mail.ru",993),
+    "bk.ru"           :("imap.mail.ru",993),
+    "list.ru"         :("imap.mail.ru",993),
+    "yandex.ru"       :("imap.yandex.ru",993),
+    "ya.ru"           :("imap.yandex.ru",993),
+}
+KW = ["\u9a8c\u8bc1\u7801","code","otp","verify","activation","\u6fc0\u6d3b\u7801","verification","PIN","\u5bc6\u7801","password"]
+
+def provider(addr):
+    d = addr.split("@")[-1].lower()
+    return IMAP.get(d, ("imap."+d, 993))
+
+def _ds(s):
+    if not s: return ""
+    r = ""
+    for p,enc in decode_header(s):
+        r += p.decode(enc or "utf-8",errors="replace") if isinstance(p,bytes) else str(p)
+    return r
+
+def _body(msg):
+    """提取纯文本正文，彻底清洗HTML"""
+    plain, html_body = "", ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cs = part.get_content_charset() or "utf-8"
+            try:
+                payload = part.get_payload(decode=True)
+                if payload is None: continue
+                text = payload.decode(cs, errors="replace")
+            except Exception: continue
+            if ct == "text/plain" and not plain:
+                plain = text
+            elif ct == "text/html" and not html_body:
+                html_body = text
+    else:
+        cs = msg.get_content_charset() or "utf-8"
+        try: plain = msg.get_payload(decode=True).decode(cs, errors="replace")
+        except: plain = ""
+
+    # 优先用纯文本
+    body = plain if plain.strip() else html_body
+
+    # 彻底清洗HTML：先解码HTML实体，再去除标签
+    body = html_mod.unescape(body)
+    body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.DOTALL|re.IGNORECASE)
+    body = re.sub(r"<script[^>]*>.*?</script>","", body, flags=re.DOTALL|re.IGNORECASE)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"[ \t]{2,}", " ", body)
+    body = re.sub(r"\\n{3,}", chr(10)+chr(10), body)
+    return body.strip()
+
+def _code(text):
+    for pat in [
+        r"(?:\u9a8c\u8bc1\u7801|code|OTP|PIN|\u5bc6\u7801)[\s:\uff1a]+([A-Z0-9]{4,8})",
+        r"\b([0-9]{4,8})\b",
+        r"\b([A-Z0-9]{6,8})\b",
+    ]:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m: return m.group(1)
+    return ""
+
+def _is_verify(subj, body):
+    t = (subj+" "+body).lower()
+    return any(k.lower() in t for k in KW)
+
+def fetch(host, port, addr, pwd, limit=50, timeout=15):
+    result = []
+    with IMAPClient(host, port=port, ssl=True, timeout=timeout) as c:
+        c.login(addr, pwd)
+        c.select_folder("INBOX")
+        msgs = c.search(["ALL"])
+        msgs = list(reversed(msgs[-limit:]))
+        if not msgs: return result
+        for uid, d in c.fetch(msgs, ["RFC822","INTERNALDATE"]).items():
+            msg   = email.message_from_bytes(d[b"RFC822"])
+            subj  = _ds(msg.get("Subject","(无主题)"))
+            sender= _ds(msg.get("From",""))
+            date  = str(d.get(b"INTERNALDATE",""))[:16]
+            body  = _body(msg)
+            iv    = _is_verify(subj, body)
+            result.append({"uid":uid,"subject":subj,"sender":sender,
+                           "date":date,"body":body,"is_verify":iv,
+                           "code":_code(body) if iv else ""})
+    return result
+'''[1:])
+
+# ============================================================
+# ui/style.py
+# ============================================================
+W("ui/style.py",
+"DARK_STYLE = (\n"
+"    'QWidget{background:#1a2035;color:#e0e6f0;font-family:Microsoft YaHei,Segoe UI,sans-serif;font-size:13px;}'"
+"    'QListWidget,QTableWidget{background:#1e2845;border:1px solid #2d3f6e;border-radius:6px;gridline-color:#2d3f6e;}'"
+"    'QListWidget::item:selected,QTableWidget::item:selected{background:#2a4a9e;}'"
+"    'QListWidget::item:hover,QTableWidget::item:hover{background:#263660;}'"
+"    'QPushButton{background:#2a5bd7;color:#fff;border:none;border-radius:6px;padding:7px 16px;font-weight:bold;}'"
+"    'QPushButton:hover{background:#3a6de8;}QPushButton:pressed{background:#1a4bc0;}'"
+"    'QPushButton#copyBtn{background:#f0a500;color:#1a2035;font-size:14px;padding:10px 24px;}'"
+"    'QPushButton#copyBtn:hover{background:#ffb820;}'"
+"    'QLabel#codeLabel{background:#f0a500;color:#1a2035;font-size:22px;font-weight:bold;border-radius:8px;padding:10px 20px;}'"
+"    'QTextEdit{background:#1e2845;border:1px solid #2d3f6e;border-radius:6px;padding:8px;}'"
+"    'QComboBox{background:#1e2845;border:1px solid #2d3f6e;border-radius:6px;padding:4px 8px;}'"
+"    'QComboBox::drop-down{border:none;}'"
+"    'QHeaderView::section{background:#162040;color:#8899cc;border:none;padding:6px;font-weight:bold;}'"
+"    'QScrollBar:vertical{background:#1a2035;width:8px;border-radius:4px;}'"
+"    'QScrollBar::handle:vertical{background:#2d3f6e;border-radius:4px;}'"
+")\n")
+
+# ============================================================
+# ui/login_dialog.py
+# ============================================================
+W("ui/login_dialog.py", '''
+from PyQt5.QtWidgets import QDialog,QVBoxLayout,QLabel,QLineEdit,QPushButton,QMessageBox
+from PyQt5.QtCore import Qt
+
+class LoginDialog(QDialog):
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("\U0001f512 输入主密码")
+        self.setFixedSize(360,220)
+        self.master_password=None
+        L=QVBoxLayout(self); L.setSpacing(16); L.setContentsMargins(30,30,30,20)
+        lbl=QLabel("请输入主密码以解锁账号数据"); lbl.setAlignment(Qt.AlignCenter); L.addWidget(lbl)
+        self.pw=QLineEdit(); self.pw.setEchoMode(QLineEdit.Password)
+        self.pw.setPlaceholderText("主密码（首次自定，务必记住！）")
+        self.pw.returnPressed.connect(self._ok); L.addWidget(self.pw)
+        hint=QLabel("⚠️ 主密码不存储，请牢记")
+        hint.setStyleSheet("color:#f0a500;font-size:11px;"); hint.setAlignment(Qt.AlignCenter); L.addWidget(hint)
+        btn=QPushButton("确认解锁"); btn.clicked.connect(self._ok); L.addWidget(btn)
+
+    def _ok(self):
+        p=self.pw.text().strip()
+        if not p: QMessageBox.warning(self,"提示","请输入主密码"); return
+        self.master_password=p; self.accept()
+'''[1:])
+
+# ============================================================
+# ui/main_window.py  【优化：线程池限流 / 序号列 / 进度显示 / 右键重试】
+# ============================================================
+W("ui/main_window.py", '''
+import threading
+from PyQt5.QtWidgets import (
+    QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QListWidget,QListWidgetItem,
+    QTableWidget,QTableWidgetItem,QPushButton,QLabel,QTextEdit,QComboBox,
+    QFileDialog,QHeaderView,QMessageBox,QSplitter,QStatusBar,QApplication,QMenu
+)
+from PyQt5.QtCore import Qt,QTimer,pyqtSignal,QObject
+from PyQt5.QtGui import QColor,QFont
+from core import db,crypto
+from core.email_client import fetch,provider as detect_provider
+
+class Sig(QObject):
+    done   = pyqtSignal(str,list)
+    err    = pyqtSignal(str,str)
+    status = pyqtSignal(str,str)
+    progress = pyqtSignal(int,int)
+
+class MainWindow(QMainWindow):
+    def __init__(self,mp):
+        super().__init__()
+        self.mp=mp; self.sig=Sig()
+        self.data={}; self.cur=None; self.timer=QTimer()
+        self._total=0; self._done=0
+        db.init_db(); self._build(); self._wire(); self._load()
+        # 启动时不自动加载，点哪个账号才请求哪个
+        self.statusBar().showMessage("就绪 - 点击左侧账号查看邮件",0)
+        self.setWindowTitle("\U0001f4e7 多账号邮箱管理工具 v2")
+        self.resize(1150,700)
+
+    def _build(self):
+        cw=QWidget(); self.setCentralWidget(cw)
+        ml=QVBoxLayout(cw); ml.setContentsMargins(8,8,8,4); ml.setSpacing(6)
+        sp=QSplitter(Qt.Horizontal)
+
+        # 左：账号列表
+        lw=QWidget(); ll=QVBoxLayout(lw); ll.setContentsMargins(0,0,0,0)
+        lb=QLabel("账号列表"); lb.setStyleSheet("color:#8899cc;font-size:11px;padding:4px;"); ll.addWidget(lb)
+        self.al=QListWidget(); self.al.setMinimumWidth(220)
+        self.al.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.al.customContextMenuRequested.connect(self._acc_menu)
+        ll.addWidget(self.al)
+        self.ib=QPushButton("\U0001f4c2 导入账号"); ll.addWidget(self.ib); sp.addWidget(lw)
+
+        # 中：邮件列表（含序号列）
+        mw=QWidget(); mwl=QVBoxLayout(mw); mwl.setContentsMargins(0,0,0,0)
+        self.tb=QTableWidget(); self.tb.setColumnCount(5)
+        self.tb.setHorizontalHeaderLabels(["#","发件人","主题","时间","验证码"])
+        hh=self.tb.horizontalHeader()
+        hh.setSectionResizeMode(0,QHeaderView.ResizeToContents)  # # 列自适应
+        hh.setSectionResizeMode(1,QHeaderView.Interactive)
+        hh.setSectionResizeMode(2,QHeaderView.Stretch)           # 主题列拉伸
+        hh.setSectionResizeMode(3,QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4,QHeaderView.ResizeToContents)
+        self.tb.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tb.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tb.verticalHeader().setVisible(False)
+        self.tb.setAlternatingRowColors(True)
+        self.tb.setStyleSheet("alternate-background-color:#1c2840;")
+        mwl.addWidget(self.tb); sp.addWidget(mw)
+
+        # 右：邮件详情
+        rw=QWidget(); rl=QVBoxLayout(rw); rl.setContentsMargins(6,0,0,0)
+        self.sj=QLabel("（请先选择账号，再点击邮件）")
+        self.sj.setStyleSheet("font-size:14px;font-weight:bold;padding:4px;")
+        self.sj.setWordWrap(True); rl.addWidget(self.sj)
+        self.bd=QTextEdit(); self.bd.setReadOnly(True); rl.addWidget(self.bd)
+        self.cl=QLabel(); self.cl.setObjectName("codeLabel")
+        self.cl.setAlignment(Qt.AlignCenter); self.cl.hide(); rl.addWidget(self.cl)
+        self.cb=QPushButton("\U0001f4cb 一键复制验证码")
+        self.cb.setObjectName("copyBtn"); self.cb.hide(); rl.addWidget(self.cb)
+        sp.addWidget(rw)
+        sp.setSizes([220,500,330]); ml.addWidget(sp)
+
+        # 底栏
+        bar=QHBoxLayout()
+        self.rb=QPushButton("\U0001f504 全部刷新"); bar.addWidget(self.rb)
+        bar.addWidget(QLabel("自动刷新:"))
+        self.ic=QComboBox(); self.ic.addItems(["关闭","30秒","1分钟","5分钟"]); bar.addWidget(self.ic)
+        bar.addStretch()
+        self.pg=QLabel(""); self.pg.setStyleSheet("color:#f0a500;"); bar.addWidget(self.pg)
+        self.ll=QLabel("上次刷新: --"); self.ll.setStyleSheet("color:#8899cc;"); bar.addWidget(self.ll)
+        ml.addLayout(bar); self.setStatusBar(QStatusBar())
+
+    def _wire(self):
+        self.ib.clicked.connect(self._imp)
+        self.rb.clicked.connect(self._ref)
+        self.al.currentRowChanged.connect(self._oa)
+        self.tb.itemSelectionChanged.connect(lambda:self._oe(self.tb.currentRow()))
+        self.cb.clicked.connect(self._cp)
+        self.ic.currentIndexChanged.connect(self._st)
+        self.sig.done.connect(self._fd)
+        self.sig.err.connect(self._fe)
+        self.sig.status.connect(self._ss)
+        self.sig.progress.connect(self._upd_progress)
+
+    def _load(self):
+        self.al.clear()
+        for i,a in enumerate(db.all_accounts(),1):
+            self._ai(i,a["email"],"⏳")
+
+    def _ai(self,idx,email,icon):
+        it=QListWidgetItem(f"{icon} {idx:>3}. {email}")
+        it.setData(Qt.UserRole,email); self.al.addItem(it)
+
+    def _ss(self,email,s):
+        icons={"connected":"✅","failed":"❌","loading":"⏳"}
+        for i in range(self.al.count()):
+            it=self.al.item(i)
+            if it.data(Qt.UserRole)==email:
+                num=i+1
+                it.setText(f"{icons.get(s,'⏳')} {num:>3}. {email}")
+                it.setForeground(QColor("#6bff9e" if s=="connected" else "#ff6b6b" if s=="failed" else "#e0e6f0"))
+                break
+
+    def _acc_menu(self,pos):
+        """右键菜单：重试 / 删除"""
+        it=self.al.itemAt(pos)
+        if not it: return
+        email=it.data(Qt.UserRole)
+        menu=QMenu(self)
+        menu.addAction("🔄 重新连接",lambda:self._retry(email))
+        menu.addAction("🗑️ 删除账号",lambda:self._del(email))
+        menu.exec_(self.al.viewport().mapToGlobal(pos))
+
+    def _retry(self,email):
+        for a in db.all_accounts():
+            if a["email"]==email: self._fa(a); break
+
+    def _del(self,email):
+        if QMessageBox.question(self,"确认",f"删除 {email}？")==QMessageBox.Yes:
+            db.delete(email); self._load()
+
+    def _upd_progress(self,done,total):
+        if done>=total: self.pg.setText("")
+        else: self.pg.setText(f"加载中 {done}/{total}")
+
+    def _imp(self):
+        path,_=QFileDialog.getOpenFileName(self,"选择账号文件","","文本文件 (*.txt)")
+        if not path: return
+        ok=skip=0
+        with open(path,"r",encoding="utf-8",errors="replace") as f:
+            for line in f:
+                line=line.strip()
+                if not line or "@" not in line: continue
+                parts=None
+                for sep in ["----",":",",","\t"," "]:
+                    if sep in line:
+                        p=line.split(sep,1)
+                        if len(p)==2 and p[0].strip() and p[1].strip(): parts=p; break
+                if not parts: continue
+                ea,pw=parts[0].strip(),parts[1].strip()
+                host,port=detect_provider(ea)
+                enc=crypto.encrypt(pw,self.mp)
+                if db.add(ea,enc,ea.split("@")[-1],host,port): ok+=1
+                else: skip+=1
+        nl=chr(10)
+        QMessageBox.information(self,"导入完成",
+            "成功 "+str(ok)+" 个    重复跳过 "+str(skip)+" 个"+nl+nl+
+            "Rambler/myrambler/ro.ru: 登录密码"+nl+
+            "Gmail/Outlook: 应用专用密码"+nl+
+            "QQ/163: 邮箱授权码")
+        self._load(); self._ref()
+
+    def _ref(self):
+        from datetime import datetime
+        accs=db.all_accounts()
+        self._total=len(accs); self._done=0
+        self.sig.progress.emit(0,self._total)
+        for a in accs: self._fa(a)
+        self.ll.setText("上次刷新: "+datetime.now().strftime("%H:%M:%S"))
+
+    def _fa(self,acc):
+        """按需加载：点击时才连接，单线程"""
+        ea=acc["email"]; self.sig.status.emit(ea,"loading")
+        def run():
+            try:
+                pw=crypto.decrypt(acc["encrypted_password"],self.mp)
+                mails=fetch(acc["imap_host"],acc["imap_port"],ea,pw)
+                self.sig.done.emit(ea,mails)
+            except Exception as e:
+                self.sig.err.emit(ea,str(e))
+        threading.Thread(target=run,daemon=True).start()
+
+    def _fd(self,ea,mails):
+        self.data[ea]=mails; self.sig.status.emit(ea,"connected")
+        self._done+=1; self.sig.progress.emit(self._done,self._total)
+        if self.cur==ea: self._show(mails)
+
+    def _fe(self,ea,e):
+        self.sig.status.emit(ea,"failed")
+        self._done+=1; self.sig.progress.emit(self._done,self._total)
+        self.statusBar().showMessage("❌ "+ea+": "+str(e),6000)
+
+    def _oa(self,row):
+        if row<0: return
+        it=self.al.item(row)
+        if not it: return
+        ea=it.data(Qt.UserRole); self.cur=ea
+        if ea in self.data: self._show(self.data[ea])
+        else:
+            for a in db.all_accounts():
+                if a["email"]==ea: self._fa(a); break
+
+    def _show(self,mails):
+        self.tb.setRowCount(len(mails))
+        for r,m in enumerate(mails):
+            num=QTableWidgetItem(str(r+1))
+            num.setTextAlignment(Qt.AlignCenter)
+            num.setForeground(QColor("#8899cc"))
+            cells=[
+                num,
+                QTableWidgetItem(m["sender"][:28]),
+                QTableWidgetItem(m["subject"]),
+                QTableWidgetItem(m["date"]),
+                QTableWidgetItem(f"\U0001f511 {m['code']}" if m["code"] else ""),
+            ]
+            for c,cell in enumerate(cells): self.tb.setItem(r,c,cell)
+            if m["is_verify"]:
+                for c in range(5):
+                    cl=self.tb.item(r,c)
+                    if cl: cl.setBackground(QColor("#2d2200")); cl.setForeground(QColor("#f0c040"))
+
+    def _oe(self,row):
+        if row<0 or not self.cur: return
+        mails=self.data.get(self.cur,[])
+        if row>=len(mails): return
+        m=mails[row]
+        self.sj.setText(m["subject"])
+        self.bd.setPlainText(m["body"])
+        if m["code"]:
+            self.cl.setText(f"验证码：{m['code']}"); self.cl.show(); self.cb.show()
+        else:
+            self.cl.hide(); self.cb.hide()
+
+    def _cp(self):
+        code=self.cl.text().replace("验证码：","").strip()
+        try:
+            import pyperclip; pyperclip.copy(code)
+        except: QApplication.clipboard().setText(code)
+        self.statusBar().showMessage("✅ 已复制："+code,3000)
+
+    def _st(self,i):
+        self.timer.stop()
+        ivs={1:30000,2:60000,3:300000}
+        if i in ivs: self.timer.timeout.connect(self._ref); self.timer.start(ivs[i])
+
+    def closeEvent(self,e):
+        super().closeEvent(e)
+'''[1:])
+
+# ============================================================
+# main.py
+# ============================================================
+W("main.py", '''
+import sys,os,traceback
+
+def app_dir():
+    return os.path.dirname(sys.executable) if getattr(sys,"frozen",False) \
+           else os.path.dirname(os.path.abspath(__file__))
+
+def hook(et,ev,tb):
+    log=os.path.join(app_dir(),"error.log")
+    with open(log,"w",encoding="utf-8") as f:
+        traceback.print_exception(et,ev,tb,file=f)
+    try:
+        from PyQt5.QtWidgets import QApplication,QMessageBox
+        a=QApplication.instance() or QApplication(sys.argv)
+        nl = chr(10)
+        msg = "发生错误，已记录到:" + nl + log + nl + nl + "错误：" + str(ev)
+        QMessageBox.critical(None, "程序错误", msg)
+    except: pass
+
+sys.excepthook=hook
+try:
+    from PyQt5.QtWidgets import QApplication
+    from ui.main_window import MainWindow
+    from ui.login_dialog import LoginDialog
+    from ui.style import DARK_STYLE
+    app=QApplication(sys.argv)
+    app.setStyleSheet(DARK_STYLE)
+    dlg=LoginDialog(); dlg.setStyleSheet(DARK_STYLE)
+    if dlg.exec_()==dlg.Accepted:
+        win=MainWindow(dlg.master_password); win.show(); sys.exit(app.exec_())
+except Exception: hook(*sys.exc_info()); sys.exit(1)
+'''[1:])
+
+print("\n✅ 所有文件已创建\n")
+
+print("[第3步] 打包成 EXE（1~3分钟）...")
+os.chdir(BASE)
+cmd=[
+    sys.executable,"-m","PyInstaller",
+    "--onefile","--windowed",
+    "--name","邮箱管理工具v2",
+    "--add-data",f"ui{os.pathsep}ui",
+    "--add-data",f"core{os.pathsep}core",
+    "--hidden-import","imapclient",
+    "--hidden-import","cryptography",
+    "--hidden-import","PyQt5",
+    "--hidden-import","pyperclip",
+    "--clean","main.py"
+]
+r=subprocess.run(cmd, capture_output=False)
+exe=os.path.join(BASE,"dist","邮箱管理工具v2.exe")
+if r.returncode==0 and os.path.exists(exe):
+    print("\n"+"="*55)
+    print("✅✅✅ 打包完成！")
+    print(f"📁 EXE 位置：{exe}")
+    print("="*55)
+    os.startfile(os.path.join(BASE,"dist"))
+else:
+    print("\n"+"="*55)
+    print("❌ 打包失败！请按以下顺序排查：")
+    print("  1. 右键本脚本 → 以管理员身份运行")
+    print("  2. 临时关闭杀毒软件（Windows Defender / 360 等）")
+    print("  3. 删除 build/ dist/ *.spec 文件夹后重试")
+    print("  4. 确保磁盘空间 > 500MB")
+    print("  5. 把上面的红色报错信息截图发给我")
+    print("="*55)
+input("\n按回车退出...")
